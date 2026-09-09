@@ -1,0 +1,17 @@
+{
+	"luci-app-gale-led": {
+		"description": "Manage the local Google Wifi Gale status LED",
+		"read": {
+			"ubus": {
+				"gale-led": [ "hardware", "interfaces", "status" ]
+			},
+			"uci": [ "gale-led" ]
+		},
+		"write": {
+			"ubus": {
+				"gale-led": [ "apply" ]
+			},
+			"uci": [ "gale-led" ]
+		}
+	}
+}

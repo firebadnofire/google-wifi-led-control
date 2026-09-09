@@ -1,0 +1,71 @@
+'use strict';
+
+import { popen, access } from 'fs';
+
+const binary = '/usr/bin/gale-led';
+const initScript = '/etc/init.d/gale-led';
+
+function runJson(command) {
+	let pipe = popen(command + ' 2>&1', 'r');
+	if (!pipe)
+		return { ok: false, error: 'Unable to start gale-led' };
+
+	let output = pipe.read('all') || '';
+	let status = pipe.close();
+	if (status != 0)
+		return { ok: false, error: trim(output) || 'gale-led failed' };
+
+	try {
+		return { ok: true, value: json(output) };
+	}
+	catch (e) {
+		return { ok: false, error: 'gale-led returned invalid JSON' };
+	}
+}
+
+const methods = {
+	hardware: {
+		call: function() {
+			if (!access(binary, 'x'))
+				return { supported: false, error: 'gale-led is not installed' };
+
+			let result = runJson(binary + ' hardware');
+			return result.ok ? result.value : { supported: false, error: result.error };
+		}
+	},
+
+	status: {
+		call: function() {
+			if (!access(binary, 'x'))
+				return { ok: false, error: 'gale-led is not installed' };
+
+			let result = runJson(binary + ' status');
+			return result.ok ? { ok: true, status: result.value } : result;
+		}
+	},
+
+	interfaces: {
+		call: function() {
+			if (!access(binary, 'x'))
+				return { interfaces: [], error: 'gale-led is not installed' };
+
+			let result = runJson(binary + ' interfaces');
+			return result.ok ? result.value : { interfaces: [], error: result.error };
+		}
+	},
+
+	apply: {
+		call: function() {
+			if (!access(initScript, 'x'))
+				return { ok: false, error: 'gale-led init script is not installed' };
+
+			if (system(initScript + ' reload >/dev/null 2>&1') != 0)
+				return { ok: false, error: 'Unable to apply the Gale LED configuration' };
+
+			let result = runJson(binary + ' status');
+			return result.ok ? { ok: true, status: result.value } : result;
+		}
+	}
+};
+
+return { 'gale-led': methods };

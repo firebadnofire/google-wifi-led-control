@@ -1,0 +1,179 @@
+name: Build and publish OpenWrt release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH tag to build
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      OPENWRT_VERSION: '25.12.2'
+      OPENWRT_TARGET: ipq40xx
+      OPENWRT_SUBTARGET: chromium
+      OPENWRT_ARCH: arm_cortex-a7_neon-vfpv4
+      SDK_FILE: openwrt-sdk-25.12.2-ipq40xx-chromium_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst
+      SDK_SHA256: 574197ecb6f0f858c76d674088a936cb5fbedfa6c352614643eb66e0b3084711
+      FORGEJO_API_URL: ${{ forgejo.api_url }}
+      FORGEJO_REPOSITORY: ${{ forgejo.repository }}
+      FORGEJO_TOKEN: ${{ forgejo.token }}
+      GH_KEY: ${{ secrets.GH_KEY }}
+      CI_KEY: ${{ secrets.CI_KEY }}
+      CI_KEY_PASSPHRASE: ${{ secrets.CI_KEY_PASSPHRASE }}
+
+    steps:
+      - name: Check out requested source tag
+        uses: https://data.forgejo.org/actions/checkout@v4.2.2
+        with:
+          ref: ${{ inputs.tag || forgejo.ref }}
+
+      - name: Validate tag and source version
+        env:
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag=${MANUAL_TAG:-${FORGEJO_REF_NAME:-}}
+          if [[ ! $tag =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]]; then
+            echo "release tag must be vMAJOR.MINOR.PATCH with an optional SemVer prerelease" >&2
+            exit 1
+          fi
+          version=${tag#v}
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          package_version=$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -n1)
+          if [[ $cargo_version != "$version" || $package_version != "$version" ]]; then
+            echo "tag $tag does not match Cargo.toml ($cargo_version) and Makefile ($package_version)" >&2
+            exit 1
+          fi
+          echo "RELEASE_TAG=$tag" >> "$FORGEJO_ENV"
+          echo "RELEASE_VERSION=$version" >> "$FORGEJO_ENV"
+          if [[ $version == *-* ]]; then
+            echo 'RELEASE_PRERELEASE=true' >> "$FORGEJO_ENV"
+          else
+            echo 'RELEASE_PRERELEASE=false' >> "$FORGEJO_ENV"
+          fi
+
+      - name: Verify runner dependencies
+        run: |
+          set -euo pipefail
+          for command in bash rustup curl jq gpg python3 tar zstd sha256sum file make gcc g++ rsync; do
+            command -v "$command" >/dev/null || { echo "required runner command missing: $command" >&2; exit 1; }
+          done
+          rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.90.0
+          rustc --version
+          cargo --version
+          rustup target add armv7-unknown-linux-musleabihf
+
+      - name: Validate and test source
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          bash ./scripts/validate-static.sh
+
+      - name: Restore OpenWrt and Cargo caches
+        uses: https://data.forgejo.org/actions/cache@v4.2.4
+        with:
+          path: |
+            .cache/openwrt
+            .openwrt-sdk/dl
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: openwrt-${{ runner.os }}-25.12.2-ipq40xx-chromium-574197ec
+
+      - name: Download and verify official OpenWrt SDK
+        run: |
+          set -euo pipefail
+          mkdir -p .cache/openwrt .openwrt-sdk
+          archive=".cache/openwrt/$SDK_FILE"
+          if [[ ! -f $archive ]]; then
+            curl --fail --location --retry 3 --output "$archive" \
+              "https://downloads.openwrt.org/releases/$OPENWRT_VERSION/targets/$OPENWRT_TARGET/$OPENWRT_SUBTARGET/$SDK_FILE"
+          fi
+          printf '%s  %s\n' "$SDK_SHA256" "$archive" | sha256sum --check --strict
+          tar --zstd --extract --file "$archive" --directory .openwrt-sdk --strip-components=1
+
+      - name: Build installable OpenWrt packages
+        run: |
+          set -euo pipefail
+          rm -rf .openwrt-sdk/package/gale-led
+          mkdir -p .openwrt-sdk/package/gale-led
+          rsync -a --delete \
+            --exclude='.git/' --exclude='.openwrt-sdk/' --exclude='release/' --exclude='target/' \
+            ./ .openwrt-sdk/package/gale-led/
+          {
+            echo 'CONFIG_PACKAGE_gale-led=m'
+            echo 'CONFIG_PACKAGE_luci-app-gale-led=m'
+          } >> .openwrt-sdk/.config
+          make -C .openwrt-sdk defconfig
+          make -C .openwrt-sdk package/gale-led/clean
+          make -C .openwrt-sdk package/gale-led/compile V=s
+
+      - name: Collect and inspect release packages
+        run: |
+          set -euo pipefail
+          rm -rf release
+          mkdir release
+          mapfile -t packages < <(find .openwrt-sdk/bin/packages -type f \
+            \( -name "gale-led-${RELEASE_VERSION}-*.apk" -o -name "luci-app-gale-led-${RELEASE_VERSION}-*.apk" \) \
+            | LC_ALL=C sort)
+          if (( ${#packages[@]} != 2 )); then
+            printf 'expected exactly two APKs, found %d\n' "${#packages[@]}" >&2
+            printf '%s\n' "${packages[@]}" >&2
+            exit 1
+          fi
+          cp -- "${packages[@]}" release/
+          test "$(find release -maxdepth 1 -name '*.apk' | wc -l)" -eq 2
+          file release/*.apk
+
+      - name: Sign packages and checksums
+        run: |
+          set -euo pipefail
+          : "${CI_KEY:?CI_KEY secret is required}"
+          : "${CI_KEY_PASSPHRASE:?CI_KEY_PASSPHRASE secret is required}"
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d)
+          cleanup() { rm -rf -- "$GNUPGHOME"; }
+          trap cleanup EXIT
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$CI_KEY" | gpg --batch --import
+          passphrase_file="$GNUPGHOME/passphrase"
+          printf '%s' "$CI_KEY_PASSPHRASE" > "$passphrase_file"
+          chmod 600 "$passphrase_file"
+          mapfile -t packages < <(find release -maxdepth 1 -type f -name '*.apk' -printf '%f\n' | LC_ALL=C sort)
+          (
+            cd release
+            sha256sum "${packages[@]}" > SHA256SUMS
+            for package in "${packages[@]}"; do
+              gpg --batch --yes --pinentry-mode loopback --passphrase-file "$passphrase_file" \
+                --armor --detach-sign "$package"
+            done
+            gpg --batch --yes --pinentry-mode loopback --passphrase-file "$passphrase_file" \
+              --armor --detach-sign SHA256SUMS
+          )
+          test "$(find release -maxdepth 1 -name '*.asc' | wc -l)" -eq 3
+          gpg --batch --verify release/SHA256SUMS.asc release/SHA256SUMS
+          for package in release/*.apk; do gpg --batch --verify "$package.asc" "$package"; done
+          (cd release && sha256sum --check --strict SHA256SUMS)
+
+      - name: Publish Forgejo and GitHub releases
+        env:
+          RELEASE_BODY: |
+            OpenWrt 25.12.x packages for Google Wifi (Gale), target ipq40xx/chromium.
+
+            Verify package bytes with SHA256SUMS and the accompanying armored GPG signatures before installation.
+        run: |
+          set -euo pipefail
+          : "${FORGEJO_TOKEN:?automatic Forgejo token is required}"
+          : "${GH_KEY:?GH_KEY secret is required}"
+          export RELEASE_NAME="Google Wifi LED Control $RELEASE_TAG"
+          bash ./scripts/publish-release.sh forgejo release
+          bash ./scripts/publish-release.sh github release
