@@ -98,7 +98,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
-          for command in bash cargo rustc rustup rustfmt clippy-driver curl jq gpg python3 tar zstd sha256sum file make gcc g++ rsync; do
+          for command in bash cargo rustc rustup rustfmt clippy-driver curl jq gpg base64 python3 tar zstd sha256sum file make gcc g++ rsync; do
             command -v "$command" >/dev/null || { echo "required runner command missing: $command" >&2; exit 1; }
           done
           rustc --version
@@ -112,6 +112,7 @@ jobs:
           cargo test --all-targets --locked
           cargo clippy --all-targets --locked -- -D warnings
           bash ./scripts/validate-static.sh
+          python3 ./scripts/test_release_signing.py
 
       - name: Restore OpenWrt and Cargo caches
         if: ${{ env.LOCAL_RELEASE_DRY_RUN != '1' }}
@@ -176,14 +177,20 @@ jobs:
         run: |
           set -euo pipefail
           cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
-          : "${CI_KEY:?CI_KEY secret is required}"
+          : "${CI_KEY:?base64-encoded CI_KEY secret is required}"
           : "${CI_KEY_PASSPHRASE:?CI_KEY_PASSPHRASE secret is required}"
           export GNUPGHOME
           GNUPGHOME=$(mktemp -d)
           cleanup() { rm -rf -- "$GNUPGHOME"; }
           trap cleanup EXIT
           chmod 700 "$GNUPGHOME"
-          printf '%s' "$CI_KEY" | gpg --batch --import
+          umask 077
+          if ! printf '%s' "$CI_KEY" | base64 --decode > "$GNUPGHOME/signing-key"; then
+            echo 'CI_KEY must be a valid base64-encoded OpenPGP secret key' >&2
+            exit 1
+          fi
+          gpg --batch --import "$GNUPGHOME/signing-key"
+          rm -f -- "$GNUPGHOME/signing-key"
           passphrase_file="$GNUPGHOME/passphrase"
           printf '%s' "$CI_KEY_PASSPHRASE" > "$passphrase_file"
           chmod 600 "$passphrase_file"

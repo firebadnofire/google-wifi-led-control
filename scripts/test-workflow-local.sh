@@ -23,7 +23,7 @@ docker info >/dev/null || {
 	echo "the Docker daemon is unavailable to the current user" >&2
 	exit 1
 }
-: "${CI_KEY:?CI_KEY must contain an armored test signing secret key}"
+: "${CI_KEY:?CI_KEY must contain a base64-encoded test signing secret key}"
 : "${CI_KEY_PASSPHRASE:?CI_KEY_PASSPHRASE is required}"
 
 cd "$root"

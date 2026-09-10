@@ -151,7 +151,11 @@ The workflow does not add a GitHub remote, push Git objects, or mirror branches,
 
 Required Forgejo secrets are `CI_KEY`, `CI_KEY_PASSPHRASE`, and `GH_KEY`. `GH_KEY` should be a fine-grained GitHub token restricted to the target repository with **Contents: write** permission. The runner needs Docker and outbound HTTPS access. The job uses a digest-pinned Node 20/Debian Bookworm image, installs its build dependencies, and checksum-verifies a pinned rustup installer before selecting Rust 1.90.0 with rustfmt, Clippy, and the ARM target.
 
-To exercise the complete workflow locally on a Linux Docker host, install and verify a Forgejo Runner binary, export an armored disposable signing key as `CI_KEY` and its passphrase as `CI_KEY_PASSPHRASE`, then run:
+`CI_KEY` must contain the base64 encoding of an exported OpenPGP secret key. The signing step decodes it into a private temporary file before importing it into an isolated GPG home. Invalid base64 stops the job before key import or signing. `CI_KEY_PASSPHRASE` is the key's passphrase, not base64-encoded.
+
+Run `python3 scripts/test_release_signing.py` on Linux with Bash and GPG to test the actual workflow signing step using a disposable key, malformed base64, and invalid decoded key data. These tests do not publish releases or use production credentials.
+
+To exercise the complete workflow locally on a Linux Docker host, install and verify a Forgejo Runner binary, export a base64-encoded disposable signing key as `CI_KEY` and its passphrase as `CI_KEY_PASSPHRASE`, then run:
 
 ```sh
 FORGEJO_RUNNER=/path/to/forgejo-runner bash scripts/test-workflow-local.sh v1.0.0
