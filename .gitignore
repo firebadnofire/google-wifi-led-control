@@ -1,4 +1,5 @@
 /target/
+/.cache/
 /.openwrt-sdk/
 /release/
 *.apk

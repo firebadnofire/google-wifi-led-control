@@ -17,10 +17,13 @@ PY
 bash -n files/gale-led.init
 bash -n scripts/build-openwrt.sh
 bash -n scripts/publish-release.sh
+bash -n scripts/test-workflow-local.sh
 bash -n scripts/validate-static.sh
 
 if grep -RInE '(id_ed25519|owrt4\.internal|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' \
-	--exclude-dir=.git --exclude='README.md' --exclude='validate-static.sh' .; then
+	--exclude-dir=.git --exclude-dir=.cache --exclude-dir=.openwrt-sdk \
+	--exclude-dir=release --exclude-dir=target \
+	--exclude='README.md' --exclude='validate-static.sh' .; then
 	echo 'private test-host or key material reference found in project artifacts' >&2
 	exit 1
 fi

@@ -149,7 +149,15 @@ For an idempotent local SDK build using the same pinned release inputs, run `bas
 
 The workflow does not add a GitHub remote, push Git objects, or mirror branches, commits, tags, or refs. Forgejo handles source synchronization separately.
 
-Required Forgejo secrets are `CI_KEY`, `CI_KEY_PASSPHRASE`, and `GH_KEY`. `GH_KEY` should be a fine-grained GitHub token restricted to the target repository with **Contents: write** permission. The runner must be Ubuntu-like and provide Bash, rustup, curl, jq, GnuPG, Python 3, GNU tar with zstd, `file`, rsync, Make, GCC, and G++. The workflow installs and selects Rust 1.90.0 with rustfmt and Clippy before testing or building.
+Required Forgejo secrets are `CI_KEY`, `CI_KEY_PASSPHRASE`, and `GH_KEY`. `GH_KEY` should be a fine-grained GitHub token restricted to the target repository with **Contents: write** permission. The runner needs Docker and outbound HTTPS access. The job uses a digest-pinned Node 20/Debian Bookworm image, installs its build dependencies, and checksum-verifies a pinned rustup installer before selecting Rust 1.90.0 with rustfmt, Clippy, and the ARM target.
+
+To exercise the complete workflow locally on a Linux Docker host, install and verify a Forgejo Runner binary, export an armored disposable signing key as `CI_KEY` and its passphrase as `CI_KEY_PASSPHRASE`, then run:
+
+```sh
+FORGEJO_RUNNER=/path/to/forgejo-runner bash scripts/test-workflow-local.sh v1.0.0
+```
+
+Local mode binds the current checkout into the job container, runs the same validation, SDK, package, checksum, and signature steps, and always skips checkout, cache publication, and both release APIs. Generated files remain in the ignored `target/`, `.cache/`, `.openwrt-sdk/`, and `release/` paths. The `:z` bind-mount label supports SELinux-enforcing Docker hosts.
 
 ## Security model
 

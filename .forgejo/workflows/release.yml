@@ -10,10 +10,17 @@ on:
         description: Existing vMAJOR.MINOR.PATCH tag to build
         required: true
         type: string
+      dry_run:
+        description: Build and sign without publishing releases
+        required: true
+        default: false
+        type: boolean
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    container:
+      image: node:20-bookworm@sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2ba5d2cde28bac7d1c01c9ba5
     env:
       OPENWRT_VERSION: '25.12.2'
       OPENWRT_TARGET: ipq40xx
@@ -30,16 +37,44 @@ jobs:
 
     steps:
       - name: Check out requested source tag
-        uses: https://data.forgejo.org/actions/checkout@v4.2.2
+        if: ${{ env.LOCAL_RELEASE_DRY_RUN != '1' }}
+        uses: actions/checkout@v4.2.2
         with:
           ref: ${{ inputs.tag || forgejo.ref }}
+
+      - name: Install build dependencies and pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
+          printf 'Using workflow workspace: %s\n' "$PWD"
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            bash build-essential bzip2 ca-certificates curl file gawk gettext git gnupg jq \
+            libncurses-dev libssl-dev make perl python3 python3-distutils python3-setuptools \
+            rsync tar unzip wget zlib1g-dev zstd
+          rm -rf /var/lib/apt/lists/*
+
+          rustup_url='https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init'
+          rustup_sha256='20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c'
+          curl --fail --location --retry 3 --output /tmp/rustup-init "$rustup_url"
+          printf '%s  %s\n' "$rustup_sha256" /tmp/rustup-init | sha256sum --check --strict
+          chmod 0755 /tmp/rustup-init
+          CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup /tmp/rustup-init \
+            -y --no-modify-path --profile minimal --default-toolchain 1.90.0 \
+            --component rustfmt,clippy --target armv7-unknown-linux-musleabihf
+          rm -f /tmp/rustup-init
+          for command in cargo rustc rustup rustfmt clippy-driver; do
+            ln -sf "/root/.cargo/bin/$command" "/usr/local/bin/$command"
+          done
 
       - name: Validate tag and source version
         env:
           MANUAL_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          tag=${MANUAL_TAG:-${FORGEJO_REF_NAME:-}}
+          cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
+          tag=${MANUAL_TAG:-${LOCAL_RELEASE_TAG:-${FORGEJO_REF_NAME:-}}}
           if [[ ! $tag =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]]; then
             echo "release tag must be vMAJOR.MINOR.PATCH with an optional SemVer prerelease" >&2
             exit 1
@@ -62,24 +97,24 @@ jobs:
       - name: Verify runner dependencies
         run: |
           set -euo pipefail
-          for command in bash rustup curl jq gpg python3 tar zstd sha256sum file make gcc g++ rsync; do
+          cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
+          for command in bash cargo rustc rustup rustfmt clippy-driver curl jq gpg python3 tar zstd sha256sum file make gcc g++ rsync; do
             command -v "$command" >/dev/null || { echo "required runner command missing: $command" >&2; exit 1; }
           done
-          rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy
-          rustup default 1.90.0
           rustc --version
           cargo --version
-          rustup target add armv7-unknown-linux-musleabihf
 
       - name: Validate and test source
         run: |
           set -euo pipefail
+          cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
           cargo fmt --all -- --check
           cargo test --all-targets --locked
           cargo clippy --all-targets --locked -- -D warnings
           bash ./scripts/validate-static.sh
 
       - name: Restore OpenWrt and Cargo caches
+        if: ${{ env.LOCAL_RELEASE_DRY_RUN != '1' }}
         uses: https://data.forgejo.org/actions/cache@v4.2.4
         with:
           path: |
@@ -92,6 +127,7 @@ jobs:
       - name: Download and verify official OpenWrt SDK
         run: |
           set -euo pipefail
+          cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
           mkdir -p .cache/openwrt .openwrt-sdk
           archive=".cache/openwrt/$SDK_FILE"
           if [[ ! -f $archive ]]; then
@@ -104,6 +140,7 @@ jobs:
       - name: Build installable OpenWrt packages
         run: |
           set -euo pipefail
+          cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
           rm -rf .openwrt-sdk/package/gale-led
           mkdir -p .openwrt-sdk/package/gale-led
           rsync -a --delete \
@@ -120,6 +157,7 @@ jobs:
       - name: Collect and inspect release packages
         run: |
           set -euo pipefail
+          cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
           rm -rf release
           mkdir release
           mapfile -t packages < <(find .openwrt-sdk/bin/packages -type f \
@@ -137,6 +175,7 @@ jobs:
       - name: Sign packages and checksums
         run: |
           set -euo pipefail
+          cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
           : "${CI_KEY:?CI_KEY secret is required}"
           : "${CI_KEY_PASSPHRASE:?CI_KEY_PASSPHRASE secret is required}"
           export GNUPGHOME
@@ -165,6 +204,7 @@ jobs:
           (cd release && sha256sum --check --strict SHA256SUMS)
 
       - name: Publish Forgejo and GitHub releases
+        if: ${{ env.LOCAL_RELEASE_DRY_RUN != '1' && !inputs.dry_run }}
         env:
           RELEASE_BODY: |
             OpenWrt 25.12.x packages for Google Wifi (Gale), target ipq40xx/chromium.
@@ -172,6 +212,7 @@ jobs:
             Verify package bytes with SHA256SUMS and the accompanying armored GPG signatures before installation.
         run: |
           set -euo pipefail
+          cd "${LOCAL_WORKSPACE:-${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}}"
           : "${FORGEJO_TOKEN:?automatic Forgejo token is required}"
           : "${GH_KEY:?GH_KEY secret is required}"
           export RELEASE_NAME="Google Wifi LED Control $RELEASE_TAG"
