@@ -9,7 +9,8 @@ var GaleColorValue = form.Value.extend({
 	renderWidget: function(sectionId, optionIndex, cfgvalue) {
 		var node = this.super('renderWidget', [ sectionId, optionIndex, cfgvalue ]);
 		var textInput = node.querySelector('input');
-		var initial = /^#[0-9A-Fa-f]{6}$/.test(cfgvalue || '') ? cfgvalue.toUpperCase() : '#A020F0';
+		var fallback = /^#[0-9A-Fa-f]{6}$/.test(this.default || '') ? this.default : '#A020F0';
+		var initial = /^#[0-9A-Fa-f]{6}$/.test(cfgvalue || '') ? cfgvalue.toUpperCase() : fallback;
 		var picker = E('input', {
 			'type': 'color',
 			'value': initial,
@@ -25,7 +26,7 @@ var GaleColorValue = form.Value.extend({
 		});
 
 		textInput.setAttribute('maxlength', '7');
-		textInput.setAttribute('placeholder', '#A020F0');
+		textInput.setAttribute('placeholder', fallback);
 		textInput.setAttribute('spellcheck', 'false');
 		textInput.style.width = '8rem';
 
@@ -95,7 +96,7 @@ return view.extend({
 		s.addremove = false;
 
 		o = s.option(form.Flag, 'enabled', _('Enabled'),
-			_('Apply the selected color. When disabled, all three LED channels are turned off.'));
+			_('Apply the normal LED behavior. When disabled, the LED is off unless the ICMP failure override activates.'));
 		o.default = '1';
 		o.rmempty = false;
 
@@ -145,6 +146,91 @@ return view.extend({
 		o.retain = true;
 		o.depends('mode', 'network_activity');
 		o.depends('mode', 'network_heartbeat');
+
+		o = s.option(form.Flag, 'icmp_enabled', _('Change on ICMP failure'),
+			_('Temporarily override the normal LED behavior when the target stops responding to ICMP echo checks.'));
+		o.default = '0';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'icmp_target', _('Target'),
+			_('IPv4 address, IPv6 address, or DNS hostname used for ICMP echo checks.'));
+		o.default = '1.1.1.1';
+		o.datatype = 'or(ipaddr,hostname)';
+		o.rmempty = false;
+		o.depends('icmp_enabled', '1');
+
+		o = s.option(form.ListValue, 'failure_mode', _('Failure behavior'),
+			_('LED behavior used while the ICMP target is in the failure state.'));
+		o.value('static', _('Static color'));
+		o.value('rainbow', _('Rainbow'));
+		o.value('breathing', _('Breathing'));
+		o.value('network_activity', _('Network activity'));
+		o.value('network_heartbeat', _('Network heartbeat'));
+		o.default = 'static';
+		o.rmempty = false;
+		o.depends('icmp_enabled', '1');
+
+		o = s.option(GaleColorValue, 'failure_color', _('Failure color'),
+			_('Color used by the selected failure behavior.'));
+		o.default = '#FF0000';
+		o.validate = function(sectionId, value) {
+			return /^#[0-9A-Fa-f]{6}$/.test(value)
+				? true
+				: _('Enter a color in the exact #RRGGBB form.');
+		};
+		o.rmempty = false;
+		o.retain = true;
+		o.depends({ icmp_enabled: '1', failure_mode: 'static' });
+		o.depends({ icmp_enabled: '1', failure_mode: 'breathing' });
+		o.depends({ icmp_enabled: '1', failure_mode: 'network_activity' });
+		o.depends({ icmp_enabled: '1', failure_mode: 'network_heartbeat' });
+
+		o = s.option(GaleBrightnessValue, 'failure_brightness', _('Failure brightness'),
+			_('Overall intensity used by the failure behavior.'));
+		o.default = '100';
+		o.min = 0;
+		o.max = 100;
+		o.step = 1;
+		o.datatype = 'range(0,100)';
+		o.calcunits = '%';
+		o.rmempty = false;
+		o.depends('icmp_enabled', '1');
+
+		o = s.option(form.ListValue, 'failure_interface', _('Failure network interface'),
+			_('Network interface used by the failure activity or heartbeat behavior.'));
+		interfaces.forEach(function(networkInterface) {
+			o.value(networkInterface.name,
+				'%s (%s)'.format(networkInterface.name, networkInterface.state || _('unknown')));
+		});
+		o.default = 'br-lan';
+		o.rmempty = false;
+		o.retain = true;
+		o.depends({ icmp_enabled: '1', failure_mode: 'network_activity' });
+		o.depends({ icmp_enabled: '1', failure_mode: 'network_heartbeat' });
+
+		o = s.option(form.Value, 'icmp_retries', _('Retries'),
+			_('Number of consecutive failed ICMP checks required before activating the failure behavior.'));
+		o.default = '3';
+		o.datatype = 'uinteger';
+		o.rmempty = false;
+		o.validate = function(sectionId, value) {
+			return /^(?:[1-9][0-9]*)$/.test(value)
+				? true
+				: _('Retries must be an integer of at least 1.');
+		};
+		o.depends('icmp_enabled', '1');
+
+		o = s.option(form.Value, 'icmp_restore', _('Restore'),
+			_('Number of consecutive successful ICMP checks required before returning to the normal LED behavior.'));
+		o.default = '2';
+		o.datatype = 'uinteger';
+		o.rmempty = false;
+		o.validate = function(sectionId, value) {
+			return /^(?:[1-9][0-9]*)$/.test(value)
+				? true
+				: _('Restore must be an integer of at least 1.');
+		};
+		o.depends('icmp_enabled', '1');
 
 		return m.render().then(function(formNode) {
 			var notice;

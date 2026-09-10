@@ -4,14 +4,15 @@ START=96
 USE_PROCD=1
 
 start_service() {
-	local enabled mode
+	local enabled mode icmp_enabled
 	config_load gale-led
 	config_get enabled main enabled 1
 	config_get mode main mode static
+	config_get icmp_enabled main icmp_enabled 0
 	/usr/bin/gale-led validate || return 1
 
-	case "$enabled:$mode" in
-		1:rainbow|1:breathing|1:network_activity|1:network_heartbeat)
+	case "$icmp_enabled:$enabled:$mode" in
+		1:*|0:1:rainbow|0:1:breathing|0:1:network_activity|0:1:network_heartbeat)
 			procd_open_instance
 			procd_set_param command /usr/bin/gale-led run
 			procd_set_param respawn 3600 5 5

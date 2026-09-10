@@ -1,14 +1,20 @@
 use std::fmt;
 use std::fs;
 use std::io;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub const SYSFS_ROOT: &str = "/sys/class/leds";
 pub const SYSFS_NET_ROOT: &str = "/sys/class/net";
 pub const UCI_BIN: &str = "/sbin/uci";
+
+const PING_BIN: &str = "/bin/ping";
+const ICMP_INTERVAL: Duration = Duration::from_secs(2);
+const ICMP_TIMEOUT_SECONDS: &str = "1";
 
 const CHANNELS: [(&str, &str); 3] = [
     ("red", "LED0_Red"),
@@ -185,6 +191,130 @@ pub fn validate_interface_name(value: &str) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn validate_icmp_target(value: &str) -> Result<(), Error> {
+    if value.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    let hostname = value.strip_suffix('.').unwrap_or(value);
+    if hostname.is_empty() || value.len() > 253 {
+        return Err(Error::Config(
+            "ICMP target must be an IPv4 address, IPv6 address, or DNS hostname".into(),
+        ));
+    }
+    let valid = hostname.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    });
+    if !valid {
+        return Err(Error::Config(
+            "ICMP target must be an IPv4 address, IPv6 address, or DNS hostname".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BehaviorConfig {
+    pub mode: Mode,
+    pub color: Color,
+    pub brightness: u8,
+    pub interface: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcmpConfig {
+    pub enabled: bool,
+    pub target: String,
+    pub failure: BehaviorConfig,
+    pub retries: u32,
+    pub restore: u32,
+}
+
+impl Default for IcmpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target: "1.1.1.1".into(),
+            failure: BehaviorConfig {
+                mode: Mode::Static,
+                color: Color {
+                    red: 255,
+                    green: 0,
+                    blue: 0,
+                },
+                brightness: 100,
+                interface: "br-lan".into(),
+            },
+            retries: 3,
+            restore: 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcmpState {
+    enabled: bool,
+    retries: u32,
+    restore: u32,
+    failed: bool,
+    consecutive_failures: u32,
+    consecutive_successes: u32,
+}
+
+impl IcmpState {
+    pub fn new(config: &IcmpConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            retries: config.retries,
+            restore: config.restore,
+            failed: false,
+            consecutive_failures: 0,
+            consecutive_successes: 0,
+        }
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    pub fn observe(&mut self, success: bool) -> Option<bool> {
+        if !self.enabled {
+            return None;
+        }
+
+        if self.failed {
+            if success {
+                self.consecutive_failures = 0;
+                self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+                if self.consecutive_successes >= self.restore {
+                    self.failed = false;
+                    self.consecutive_successes = 0;
+                    return Some(false);
+                }
+            } else {
+                self.consecutive_successes = 0;
+            }
+        } else if success {
+            self.consecutive_failures = 0;
+        } else {
+            self.consecutive_successes = 0;
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            if self.consecutive_failures >= self.retries {
+                self.failed = true;
+                self.consecutive_failures = 0;
+                return Some(true);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub enabled: bool,
@@ -192,6 +322,7 @@ pub struct Config {
     pub brightness: u8,
     pub mode: Mode,
     pub interface: String,
+    pub icmp: IcmpConfig,
 }
 
 impl Config {
@@ -206,6 +337,28 @@ impl Config {
         mode: &str,
         interface: &str,
     ) -> Result<Self, Error> {
+        Self::from_all_values(
+            enabled, color, brightness, mode, interface, "0", "1.1.1.1", "static", "#FF0000",
+            "100", "br-lan", "3", "2",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_all_values(
+        enabled: &str,
+        color: &str,
+        brightness: &str,
+        mode: &str,
+        interface: &str,
+        icmp_enabled: &str,
+        icmp_target: &str,
+        failure_mode: &str,
+        failure_color: &str,
+        failure_brightness: &str,
+        failure_interface: &str,
+        icmp_retries: &str,
+        icmp_restore: &str,
+    ) -> Result<Self, Error> {
         let enabled = match enabled {
             "1" => true,
             "0" => false,
@@ -219,12 +372,56 @@ impl Config {
         let mode = Mode::parse(mode)?;
         validate_interface_name(interface)?;
 
+        let icmp_enabled = match icmp_enabled {
+            "1" => true,
+            "0" => false,
+            _ => return Err(Error::Config("icmp_enabled must be 0 or 1".into())),
+        };
+        let parse_threshold = |name: &str, value: &str| -> Result<u32, Error> {
+            let value = value
+                .parse::<u32>()
+                .map_err(|_| Error::Config(format!("{name} must be an integer of at least 1")))?;
+            if value == 0 {
+                return Err(Error::Config(format!(
+                    "{name} must be an integer of at least 1"
+                )));
+            }
+            Ok(value)
+        };
+        let icmp = if icmp_enabled {
+            validate_icmp_target(icmp_target)?;
+            let failure_mode = Mode::parse(failure_mode)?;
+            let failure_color =
+                Color::from_hex(failure_color).map_err(|error| Error::Config(error.to_string()))?;
+            let failure_brightness = failure_brightness.parse::<u8>().map_err(|_| {
+                Error::Config("failure_brightness must be an integer from 0 through 100".into())
+            })?;
+            validate_brightness(failure_brightness)
+                .map_err(|error| Error::Config(error.to_string()))?;
+            validate_interface_name(failure_interface)?;
+            IcmpConfig {
+                enabled: true,
+                target: icmp_target.into(),
+                failure: BehaviorConfig {
+                    mode: failure_mode,
+                    color: failure_color,
+                    brightness: failure_brightness,
+                    interface: failure_interface.into(),
+                },
+                retries: parse_threshold("icmp_retries", icmp_retries)?,
+                restore: parse_threshold("icmp_restore", icmp_restore)?,
+            }
+        } else {
+            IcmpConfig::default()
+        };
+
         Ok(Self {
             enabled,
             color,
             brightness,
             mode,
             interface: interface.into(),
+            icmp,
         })
     }
 
@@ -257,13 +454,30 @@ impl Config {
                 .map_err(|_| Error::Config(format!("option {key} is not valid UTF-8")))
         };
 
-        Self::from_extended_values(
+        Self::from_all_values(
             &get("enabled")?,
             &get("color")?,
             &get("brightness")?,
             &optional("mode", "static")?,
             &optional("interface", "br-lan")?,
+            &optional("icmp_enabled", "0")?,
+            &optional("icmp_target", "1.1.1.1")?,
+            &optional("failure_mode", "static")?,
+            &optional("failure_color", "#FF0000")?,
+            &optional("failure_brightness", "100")?,
+            &optional("failure_interface", "br-lan")?,
+            &optional("icmp_retries", "3")?,
+            &optional("icmp_restore", "2")?,
         )
+    }
+
+    fn normal_behavior(&self) -> BehaviorConfig {
+        BehaviorConfig {
+            mode: self.mode,
+            color: self.color,
+            brightness: self.brightness,
+            interface: self.interface.clone(),
+        }
     }
 }
 
@@ -393,6 +607,7 @@ impl Hardware {
                 "  \"configured\": {{\"enabled\": {}, \"color\": \"{}\", \"brightness\": {}}},\n",
                 "  \"mode\": \"{}\",\n",
                 "  \"interface\": \"{}\",\n",
+                "  \"icmp\": {{\"enabled\": {}, \"target\": \"{}\", \"failure_mode\": \"{}\", \"retries\": {}, \"restore\": {}}},\n",
                 "  \"hardware\": {{\"red\": {}, \"green\": {}, \"blue\": {}}}\n",
                 "}}"
             ),
@@ -401,6 +616,11 @@ impl Hardware {
             config.brightness,
             config.mode.as_str(),
             config.interface,
+            config.icmp.enabled,
+            config.icmp.target,
+            config.icmp.failure.mode.as_str(),
+            config.icmp.retries,
+            config.icmp.restore,
             values[0],
             values[1],
             values[2],
@@ -491,50 +711,116 @@ pub fn validate_runtime(config: &Config) -> Result<(), Error> {
     if config.mode.uses_network() {
         NetworkMonitor::discover(&config.interface)?;
     }
+    if config.icmp.enabled && config.icmp.failure.mode.uses_network() {
+        NetworkMonitor::discover(&config.icmp.failure.interface)?;
+    }
     Ok(())
 }
 
 pub fn run(config: &Config, hardware: &Hardware) -> Result<(), Error> {
-    if !config.enabled || !config.mode.is_dynamic() {
+    if !config.icmp.enabled && (!config.enabled || !config.mode.is_dynamic()) {
         return hardware.apply_config(config);
     }
 
     validate_runtime(config)?;
-    let network = if config.mode.uses_network() {
-        Some(NetworkMonitor::discover(&config.interface)?)
-    } else {
-        None
-    };
     hardware.prepare()?;
-    let started = Instant::now();
-    let mut previous_counters = match &network {
-        Some(monitor) if config.mode == Mode::NetworkActivity => Some(monitor.counters()?),
-        _ => None,
-    };
+    let normal_behavior = config.normal_behavior();
+    let failure_behavior = config.icmp.failure.clone();
+    let mut active = BehaviorRuntime::new(config.enabled, &normal_behavior)?;
+    let results = config
+        .icmp
+        .enabled
+        .then(|| start_icmp_monitor(&config.icmp.target));
+    let mut icmp_state = IcmpState::new(&config.icmp);
     let mut last_color = None;
 
     loop {
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let color = match config.mode {
-            Mode::Static => config.color.scaled(config.brightness)?,
-            Mode::Rainbow => rainbow_color(elapsed_ms, config.brightness)?,
-            Mode::Breathing => config.color.scaled(effect_brightness(
-                config.brightness,
+        if let Some(results) = &results {
+            for success in results.try_iter() {
+                if let Some(failed) = icmp_state.observe(success) {
+                    if failed {
+                        eprintln!("ICMP target entered failure state: {}", config.icmp.target);
+                        active = BehaviorRuntime::new(true, &failure_behavior)?;
+                    } else {
+                        eprintln!("ICMP target recovered: {}", config.icmp.target);
+                        active = BehaviorRuntime::new(config.enabled, &normal_behavior)?;
+                    }
+                    last_color = None;
+                }
+            }
+        }
+
+        let color = active.frame()?;
+        if last_color != Some(color) {
+            hardware.set_prepared(color, 100)?;
+            last_color = Some(color);
+        }
+        thread::sleep(active.frame_interval());
+    }
+}
+
+struct BehaviorRuntime {
+    enabled: bool,
+    behavior: BehaviorConfig,
+    network: Option<NetworkMonitor>,
+    previous_counters: Option<(u64, u64)>,
+    started: Instant,
+}
+
+impl BehaviorRuntime {
+    fn new(enabled: bool, behavior: &BehaviorConfig) -> Result<Self, Error> {
+        let network = if enabled && behavior.mode.uses_network() {
+            Some(NetworkMonitor::discover(&behavior.interface)?)
+        } else {
+            None
+        };
+        let previous_counters = match &network {
+            Some(monitor) if behavior.mode == Mode::NetworkActivity => Some(monitor.counters()?),
+            _ => None,
+        };
+        Ok(Self {
+            enabled,
+            behavior: behavior.clone(),
+            network,
+            previous_counters,
+            started: Instant::now(),
+        })
+    }
+
+    fn frame(&mut self) -> Result<Color, Error> {
+        if !self.enabled {
+            return Ok(Color {
+                red: 0,
+                green: 0,
+                blue: 0,
+            });
+        }
+
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        match self.behavior.mode {
+            Mode::Static => self.behavior.color.scaled(self.behavior.brightness),
+            Mode::Rainbow => rainbow_color(elapsed_ms, self.behavior.brightness),
+            Mode::Breathing => self.behavior.color.scaled(effect_brightness(
+                self.behavior.brightness,
                 breathing_level(elapsed_ms),
-            ))?,
+            )),
             Mode::NetworkActivity => {
-                let monitor = network.as_ref().ok_or_else(|| {
+                let monitor = self.network.as_ref().ok_or_else(|| {
                     Error::Config("network activity mode requires an interface".into())
                 })?;
                 let counters = monitor.counters()?;
-                let active = previous_counters.is_some_and(|previous| previous != counters);
-                previous_counters = Some(counters);
-                config
-                    .color
-                    .scaled(if active { config.brightness } else { 0 })?
+                let has_activity = self
+                    .previous_counters
+                    .is_some_and(|previous| previous != counters);
+                self.previous_counters = Some(counters);
+                self.behavior.color.scaled(if has_activity {
+                    self.behavior.brightness
+                } else {
+                    0
+                })
             }
             Mode::NetworkHeartbeat => {
-                let monitor = network.as_ref().ok_or_else(|| {
+                let monitor = self.network.as_ref().ok_or_else(|| {
                     Error::Config("network heartbeat mode requires an interface".into())
                 })?;
                 let level = if monitor.is_up()? {
@@ -542,20 +828,52 @@ pub fn run(config: &Config, hardware: &Hardware) -> Result<(), Error> {
                 } else {
                     0
                 };
-                config
+                self.behavior
                     .color
-                    .scaled(effect_brightness(config.brightness, level))?
+                    .scaled(effect_brightness(self.behavior.brightness, level))
             }
-        };
-        if last_color != Some(color) {
-            hardware.set_prepared(color, 100)?;
-            last_color = Some(color);
         }
-        thread::sleep(Duration::from_millis(match config.mode {
+    }
+
+    fn frame_interval(&self) -> Duration {
+        Duration::from_millis(match self.behavior.mode {
             Mode::NetworkActivity | Mode::NetworkHeartbeat => 100,
             _ => 50,
-        }));
+        })
     }
+}
+
+fn start_icmp_monitor(target: &str) -> Receiver<bool> {
+    let (sender, receiver) = mpsc::channel();
+    let target = target.to_owned();
+    thread::spawn(move || {
+        loop {
+            if sender.send(icmp_echo(&target)).is_err() {
+                return;
+            }
+            thread::sleep(ICMP_INTERVAL);
+        }
+    });
+    receiver
+}
+
+fn icmp_echo(target: &str) -> bool {
+    icmp_echo_with(PING_BIN, target)
+}
+
+fn icmp_echo_with(binary: &str, target: &str) -> bool {
+    let mut command = Command::new(binary);
+    command.args(["-n", "-c", "1", "-W", ICMP_TIMEOUT_SECONDS]);
+    if target.parse::<Ipv6Addr>().is_ok() {
+        command.arg("-6");
+    }
+    command
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn effect_brightness(maximum: u8, level: u8) -> u8 {
@@ -762,7 +1080,23 @@ mod tests {
                 },
                 brightness: 75,
                 mode: Mode::Static,
-                interface: "br-lan".into()
+                interface: "br-lan".into(),
+                icmp: IcmpConfig {
+                    enabled: false,
+                    target: "1.1.1.1".into(),
+                    failure: BehaviorConfig {
+                        mode: Mode::Static,
+                        color: Color {
+                            red: 255,
+                            green: 0,
+                            blue: 0,
+                        },
+                        brightness: 100,
+                        interface: "br-lan".into(),
+                    },
+                    retries: 3,
+                    restore: 2,
+                },
             }
         );
         assert!(Config::from_values("yes", "#A020F0", "75").is_err());
@@ -773,6 +1107,131 @@ mod tests {
             Config::from_extended_values("1", "#A020F0", "75", "network_activity", "../wan")
                 .is_err()
         );
+    }
+
+    fn icmp_test_config(enabled: bool, retries: u32, restore: u32) -> IcmpConfig {
+        IcmpConfig {
+            enabled,
+            target: "1.1.1.1".into(),
+            failure: BehaviorConfig {
+                mode: Mode::Static,
+                color: Color {
+                    red: 255,
+                    green: 0,
+                    blue: 0,
+                },
+                brightness: 100,
+                interface: "br-lan".into(),
+            },
+            retries,
+            restore,
+        }
+    }
+
+    #[test]
+    fn disabled_icmp_ignores_results_and_preserves_static_apply() {
+        let mut state = IcmpState::new(&icmp_test_config(false, 1, 1));
+        assert_eq!(state.observe(false), None);
+        assert!(!state.is_failed());
+
+        let fixture = Fixture::new();
+        fixture.populate();
+        let hardware = Hardware::discover_at(&fixture.root).unwrap();
+        let config = Config::from_values("1", "#A020F0", "75").unwrap();
+        run(&config, &hardware).unwrap();
+        assert_eq!(hardware.current_values().unwrap(), [120, 24, 180]);
+    }
+
+    #[test]
+    fn successful_icmp_keeps_normal_state() {
+        let mut state = IcmpState::new(&icmp_test_config(true, 3, 2));
+        assert_eq!(state.observe(true), None);
+        assert!(!state.is_failed());
+    }
+
+    #[test]
+    fn icmp_failure_activates_only_at_retry_threshold() {
+        let mut state = IcmpState::new(&icmp_test_config(true, 3, 2));
+        assert_eq!(state.observe(false), None);
+        assert_eq!(state.observe(false), None);
+        assert!(!state.is_failed());
+        assert_eq!(state.observe(false), Some(true));
+        assert!(state.is_failed());
+    }
+
+    #[test]
+    fn icmp_recovery_activates_only_at_restore_threshold() {
+        let mut state = IcmpState::new(&icmp_test_config(true, 1, 2));
+        assert_eq!(state.observe(false), Some(true));
+        assert_eq!(state.observe(true), None);
+        assert!(state.is_failed());
+        assert_eq!(state.observe(true), Some(false));
+        assert!(!state.is_failed());
+    }
+
+    #[test]
+    fn icmp_counters_reset_when_result_direction_changes() {
+        let mut state = IcmpState::new(&icmp_test_config(true, 3, 2));
+        assert_eq!(state.observe(false), None);
+        assert_eq!(state.observe(false), None);
+        assert_eq!(state.observe(true), None);
+        assert_eq!(state.observe(false), None);
+        assert_eq!(state.observe(false), None);
+        assert!(!state.is_failed());
+        assert_eq!(state.observe(false), Some(true));
+
+        assert_eq!(state.observe(true), None);
+        assert_eq!(state.observe(false), None);
+        assert_eq!(state.observe(true), None);
+        assert!(state.is_failed());
+        assert_eq!(state.observe(true), Some(false));
+    }
+
+    #[test]
+    fn validates_icmp_targets_and_probe_errors_are_failures() {
+        for valid in ["1.1.1.1", "2606:4700:4700::1111", "one.one.one.one."] {
+            validate_icmp_target(valid).unwrap();
+        }
+        for invalid in ["", "-option", "bad target", "bad..target"] {
+            assert!(validate_icmp_target(invalid).is_err());
+        }
+        assert!(!icmp_echo_with(
+            "/definitely/not/a/ping-binary",
+            "unresolvable.invalid"
+        ));
+    }
+
+    #[test]
+    fn existing_configuration_receives_icmp_defaults() {
+        let config =
+            Config::from_extended_values("1", "#A020F0", "75", "rainbow", "br-lan").unwrap();
+        assert!(!config.icmp.enabled);
+        assert_eq!(config.icmp.target, "1.1.1.1");
+        assert_eq!(config.icmp.failure.mode, Mode::Static);
+        assert_eq!(config.icmp.failure.color.to_hex(), "#FF0000");
+        assert_eq!(config.icmp.retries, 3);
+        assert_eq!(config.icmp.restore, 2);
+    }
+
+    #[test]
+    fn disabled_icmp_does_not_validate_hidden_settings() {
+        let config = Config::from_all_values(
+            "1",
+            "#A020F0",
+            "75",
+            "static",
+            "br-lan",
+            "0",
+            "not a valid target",
+            "not_a_mode",
+            "not-a-color",
+            "not-a-number",
+            "not an interface",
+            "0",
+            "0",
+        )
+        .unwrap();
+        assert_eq!(config.icmp, IcmpConfig::default());
     }
 
     #[test]

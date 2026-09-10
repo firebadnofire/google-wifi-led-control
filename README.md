@@ -2,7 +2,7 @@
 
 Google Wifi LED Control is a native OpenWrt application for setting the built-in RGB status LED on one Google Wifi **Gale** router. Each installation controls only the router on which it runs; there is no discovery, fleet management, or remote-device control.
 
-The project is intentionally static and small: LuCI stores validated settings in UCI, a narrow rpcd/ucode method asks the one-shot init service to apply them, and the Rust `gale-led` utility writes the three Linux LED brightness channels. No daemon remains running.
+The project is intentionally small: LuCI stores validated settings in UCI, a narrow rpcd/ucode method reloads the procd service, and the Rust `gale-led` utility writes the three Linux LED brightness channels. Static settings remain one-shot; animated patterns and the optional ICMP override run under procd.
 
 ## Support status
 
@@ -23,11 +23,11 @@ LuCI form
   -> /etc/config/gale-led (UCI)
   -> gale-led rpcd/ucode object (fixed methods only)
   -> /etc/init.d/gale-led reload
-  -> /usr/bin/gale-led apply
+  -> /usr/bin/gale-led apply or run
   -> /sys/class/leds/LED0_{Red,Green,Blue}
 ```
 
-At boot, `/etc/init.d/gale-led` runs `gale-led apply` once and exits. The utility verifies all three channels before taking control, sets each `trigger` to `none`, and writes only `brightness`. It never writes `led_current`; Gale's observed default remains `100` with `max_current` `120`.
+At boot, `/etc/init.d/gale-led` runs `gale-led apply` once for a static configuration, or supervises `gale-led run` for animated patterns and the optional ICMP override. The utility verifies all three channels before taking control, sets each `trigger` to `none`, and writes only `brightness`. It never writes `led_current`; Gale's observed default remains `100` with `max_current` `120`.
 
 ## Installation
 
@@ -57,6 +57,8 @@ Open **System > Gale LED**. The page provides:
 - an Enabled switch;
 - synchronized native color picker and `#RRGGBB` field;
 - a 0–100 percent brightness slider;
+- static, rainbow, breathing, network activity, and network heartbeat patterns;
+- an optional ICMP failure override with independent behavior, retry, and restore settings;
 - a live color swatch; and
 - a hardware-compatibility notice.
 
@@ -88,6 +90,16 @@ config led 'main'
 	option enabled '1'
 	option color '#A020F0'
 	option brightness '100'
+	option mode 'static'
+	option interface 'br-lan'
+	option icmp_enabled '0'
+	option icmp_target '1.1.1.1'
+	option failure_mode 'static'
+	option failure_color '#FF0000'
+	option failure_brightness '100'
+	option failure_interface 'br-lan'
+	option icmp_retries '3'
+	option icmp_restore '2'
 ```
 
 Apply a change with:
@@ -100,7 +112,7 @@ uci commit gale-led
 /etc/init.d/gale-led reload
 ```
 
-`enabled` must be `0` or `1`, `color` must be exactly `#RRGGBB`, and `brightness` must be an integer from 0 through 100. A disabled configuration writes zero brightness to all channels.
+`enabled` and `icmp_enabled` must be `0` or `1`; colors use exact `#RRGGBB`; brightness values range from 0 through 100; and retry/restore thresholds are integers of at least 1. A disabled normal configuration writes zero brightness to all channels unless an enabled ICMP override is in its failure state. Existing configurations without ICMP options retain their prior behavior because the override defaults to disabled.
 
 ## Building
 
