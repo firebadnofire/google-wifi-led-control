@@ -94,6 +94,7 @@ config led 'main'
 	option interface 'br-lan'
 	option icmp_enabled '0'
 	option icmp_target '1.1.1.1'
+	option icmp_start_delay '15'
 	option failure_mode 'static'
 	option failure_color '#FF0000'
 	option failure_brightness '100'
@@ -112,7 +113,7 @@ uci commit gale-led
 /etc/init.d/gale-led reload
 ```
 
-`enabled` and `icmp_enabled` must be `0` or `1`; colors use exact `#RRGGBB`; brightness values range from 0 through 100; and retry/restore thresholds are integers of at least 1. A disabled normal configuration writes zero brightness to all channels unless an enabled ICMP override is in its failure state. Existing configurations without ICMP options retain their prior behavior because the override defaults to disabled.
+`enabled` and `icmp_enabled` must be `0` or `1`; colors use exact `#RRGGBB`; brightness values range from 0 through 100; `icmp_start_delay` is a non-negative number of seconds; and retry/restore thresholds are integers of at least 1. The default 15-second delay lets networking initialize before the first ICMP probe. A disabled normal configuration writes zero brightness to all channels unless an enabled ICMP override is in its failure state. Existing configurations without ICMP options retain their prior behavior because the override defaults to disabled.
 
 ## Building
 

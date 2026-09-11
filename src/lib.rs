@@ -231,6 +231,7 @@ pub struct BehaviorConfig {
 pub struct IcmpConfig {
     pub enabled: bool,
     pub target: String,
+    pub start_delay: u64,
     pub failure: BehaviorConfig,
     pub retries: u32,
     pub restore: u32,
@@ -241,6 +242,7 @@ impl Default for IcmpConfig {
         Self {
             enabled: false,
             target: "1.1.1.1".into(),
+            start_delay: 15,
             failure: BehaviorConfig {
                 mode: Mode::Static,
                 color: Color {
@@ -338,7 +340,7 @@ impl Config {
         interface: &str,
     ) -> Result<Self, Error> {
         Self::from_all_values(
-            enabled, color, brightness, mode, interface, "0", "1.1.1.1", "static", "#FF0000",
+            enabled, color, brightness, mode, interface, "0", "1.1.1.1", "15", "static", "#FF0000",
             "100", "br-lan", "3", "2",
         )
     }
@@ -352,6 +354,7 @@ impl Config {
         interface: &str,
         icmp_enabled: &str,
         icmp_target: &str,
+        icmp_start_delay: &str,
         failure_mode: &str,
         failure_color: &str,
         failure_brightness: &str,
@@ -390,6 +393,9 @@ impl Config {
         };
         let icmp = if icmp_enabled {
             validate_icmp_target(icmp_target)?;
+            let start_delay = icmp_start_delay.parse::<u64>().map_err(|_| {
+                Error::Config("icmp_start_delay must be a non-negative integer".into())
+            })?;
             let failure_mode = Mode::parse(failure_mode)?;
             let failure_color =
                 Color::from_hex(failure_color).map_err(|error| Error::Config(error.to_string()))?;
@@ -402,6 +408,7 @@ impl Config {
             IcmpConfig {
                 enabled: true,
                 target: icmp_target.into(),
+                start_delay,
                 failure: BehaviorConfig {
                     mode: failure_mode,
                     color: failure_color,
@@ -462,6 +469,7 @@ impl Config {
             &optional("interface", "br-lan")?,
             &optional("icmp_enabled", "0")?,
             &optional("icmp_target", "1.1.1.1")?,
+            &optional("icmp_start_delay", "15")?,
             &optional("failure_mode", "static")?,
             &optional("failure_color", "#FF0000")?,
             &optional("failure_brightness", "100")?,
@@ -607,7 +615,7 @@ impl Hardware {
                 "  \"configured\": {{\"enabled\": {}, \"color\": \"{}\", \"brightness\": {}}},\n",
                 "  \"mode\": \"{}\",\n",
                 "  \"interface\": \"{}\",\n",
-                "  \"icmp\": {{\"enabled\": {}, \"target\": \"{}\", \"failure_mode\": \"{}\", \"retries\": {}, \"restore\": {}}},\n",
+                "  \"icmp\": {{\"enabled\": {}, \"target\": \"{}\", \"start_delay\": {}, \"failure_mode\": \"{}\", \"retries\": {}, \"restore\": {}}},\n",
                 "  \"hardware\": {{\"red\": {}, \"green\": {}, \"blue\": {}}}\n",
                 "}}"
             ),
@@ -618,6 +626,7 @@ impl Hardware {
             config.interface,
             config.icmp.enabled,
             config.icmp.target,
+            config.icmp.start_delay,
             config.icmp.failure.mode.as_str(),
             config.icmp.retries,
             config.icmp.restore,
@@ -730,7 +739,7 @@ pub fn run(config: &Config, hardware: &Hardware) -> Result<(), Error> {
     let results = config
         .icmp
         .enabled
-        .then(|| start_icmp_monitor(&config.icmp.target));
+        .then(|| start_icmp_monitor(&config.icmp.target, config.icmp.start_delay));
     let mut icmp_state = IcmpState::new(&config.icmp);
     let mut last_color = None;
 
@@ -843,12 +852,22 @@ impl BehaviorRuntime {
     }
 }
 
-fn start_icmp_monitor(target: &str) -> Receiver<bool> {
-    let (sender, receiver) = mpsc::channel();
+fn start_icmp_monitor(target: &str, start_delay: u64) -> Receiver<bool> {
     let target = target.to_owned();
+    start_icmp_monitor_with_probe(Duration::from_secs(start_delay), move || icmp_echo(&target))
+}
+
+fn start_icmp_monitor_with_probe<F>(start_delay: Duration, mut probe: F) -> Receiver<bool>
+where
+    F: FnMut() -> bool + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
+        if !start_delay.is_zero() {
+            thread::sleep(start_delay);
+        }
         loop {
-            if sender.send(icmp_echo(&target)).is_err() {
+            if sender.send(probe()).is_err() {
                 return;
             }
             thread::sleep(ICMP_INTERVAL);
@@ -1084,6 +1103,7 @@ mod tests {
                 icmp: IcmpConfig {
                     enabled: false,
                     target: "1.1.1.1".into(),
+                    start_delay: 15,
                     failure: BehaviorConfig {
                         mode: Mode::Static,
                         color: Color {
@@ -1113,6 +1133,7 @@ mod tests {
         IcmpConfig {
             enabled,
             target: "1.1.1.1".into(),
+            start_delay: 15,
             failure: BehaviorConfig {
                 mode: Mode::Static,
                 color: Color {
@@ -1207,6 +1228,7 @@ mod tests {
             Config::from_extended_values("1", "#A020F0", "75", "rainbow", "br-lan").unwrap();
         assert!(!config.icmp.enabled);
         assert_eq!(config.icmp.target, "1.1.1.1");
+        assert_eq!(config.icmp.start_delay, 15);
         assert_eq!(config.icmp.failure.mode, Mode::Static);
         assert_eq!(config.icmp.failure.color.to_hex(), "#FF0000");
         assert_eq!(config.icmp.retries, 3);
@@ -1223,6 +1245,7 @@ mod tests {
             "br-lan",
             "0",
             "not a valid target",
+            "not-a-delay",
             "not_a_mode",
             "not-a-color",
             "not-a-number",
@@ -1232,6 +1255,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.icmp, IcmpConfig::default());
+    }
+
+    #[test]
+    fn icmp_worker_waits_before_first_probe() {
+        let results = start_icmp_monitor_with_probe(Duration::from_millis(50), || true);
+        assert!(results.recv_timeout(Duration::from_millis(10)).is_err());
+        assert_eq!(results.recv_timeout(Duration::from_millis(200)), Ok(true));
+    }
+
+    #[test]
+    fn parses_configurable_icmp_start_delay() {
+        let config = Config::from_all_values(
+            "1", "#A020F0", "75", "static", "br-lan", "1", "1.1.1.1", "0", "static", "#FF0000",
+            "100", "br-lan", "3", "2",
+        )
+        .unwrap();
+        assert_eq!(config.icmp.start_delay, 0);
+
+        assert!(
+            Config::from_all_values(
+                "1", "#A020F0", "75", "static", "br-lan", "1", "1.1.1.1", "-1", "static",
+                "#FF0000", "100", "br-lan", "3", "2",
+            )
+            .is_err()
+        );
     }
 
     #[test]

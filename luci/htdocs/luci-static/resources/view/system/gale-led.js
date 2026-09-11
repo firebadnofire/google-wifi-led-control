@@ -159,6 +159,18 @@ return view.extend({
 		o.rmempty = false;
 		o.depends('icmp_enabled', '1');
 
+		o = s.option(form.Value, 'icmp_start_delay', _('Start delay'),
+			_('Seconds to wait after the service starts before performing the first ICMP check. Use 0 for no delay.'));
+		o.default = '15';
+		o.datatype = 'uinteger';
+		o.rmempty = false;
+		o.validate = function(sectionId, value) {
+			return /^(?:0|[1-9][0-9]*)$/.test(value)
+				? true
+				: _('Start delay must be a non-negative integer.');
+		};
+		o.depends('icmp_enabled', '1');
+
 		o = s.option(form.ListValue, 'failure_mode', _('Failure behavior'),
 			_('LED behavior used while the ICMP target is in the failure state.'));
 		o.value('static', _('Static color'));
