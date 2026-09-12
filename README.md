@@ -101,6 +101,13 @@ config led 'main'
 	option failure_interface 'br-lan'
 	option icmp_retries '3'
 	option icmp_restore '2'
+	option latency_fast_below '50'
+	option latency_moderate_max '100'
+	option latency_slow_max '150'
+	option latency_fast_color '#0000FF'
+	option latency_moderate_color '#00FF00'
+	option latency_slow_color '#FFFF00'
+	option latency_high_color '#FF0000'
 ```
 
 Apply a change with:
@@ -113,7 +120,7 @@ uci commit gale-led
 /etc/init.d/gale-led reload
 ```
 
-`enabled` and `icmp_enabled` must be `0` or `1`; colors use exact `#RRGGBB`; brightness values range from 0 through 100; `icmp_start_delay` is a non-negative number of seconds; and retry/restore thresholds are integers of at least 1. The default 15-second delay lets networking initialize before the first ICMP probe. A disabled normal configuration writes zero brightness to all channels unless an enabled ICMP override is in its failure state. Existing configurations without ICMP options retain their prior behavior because the override defaults to disabled.
+`enabled` and `icmp_enabled` must be `0` or `1`; colors use exact `#RRGGBB`; brightness values range from 0 through 100; `icmp_start_delay` is a non-negative number of seconds; and retry/restore thresholds are integers of at least 1. The default 15-second delay lets networking initialize before the first ICMP probe. Latency mode defaults to blue below 50 ms, green from 50 through 100 ms, yellow from 101 through 150 ms, and red above 150 ms or after a lost probe; all three boundaries and four colors are configurable. A disabled normal configuration writes zero brightness to all channels unless an enabled ICMP override is in its failure state. Existing configurations without ICMP or latency options retain their prior behavior because the override defaults to disabled.
 
 ## Building
 

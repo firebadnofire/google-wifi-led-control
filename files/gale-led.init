@@ -12,7 +12,7 @@ start_service() {
 	/usr/bin/gale-led validate || return 1
 
 	case "$icmp_enabled:$enabled:$mode" in
-		1:*|0:1:rainbow|0:1:breathing|0:1:network_activity|0:1:network_heartbeat)
+		1:*|0:1:rainbow|0:1:breathing|0:1:network_activity|0:1:network_heartbeat|0:1:latency)
 			procd_open_instance
 			procd_set_param command /usr/bin/gale-led run
 			procd_set_param respawn 3600 5 5

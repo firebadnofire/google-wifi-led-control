@@ -56,6 +56,17 @@ var GaleBrightnessValue = form.RangeSliderValue.extend({
 	}
 });
 
+function dependsOnLatency(option) {
+	option.depends('mode', 'latency');
+	option.depends({ icmp_enabled: '1', failure_mode: 'latency' });
+}
+
+function validateGaleColor(sectionId, value) {
+	return /^#[0-9A-Fa-f]{6}$/.test(value)
+		? true
+		: _('Enter a color in the exact #RRGGBB form.');
+}
+
 var callHardware = rpc.declare({
 	object: 'gale-led',
 	method: 'hardware',
@@ -107,17 +118,14 @@ return view.extend({
 		o.value('breathing', _('Breathing'));
 		o.value('network_activity', _('Network activity'));
 		o.value('network_heartbeat', _('Network heartbeat'));
+		o.value('latency', _('Latency'));
 		o.default = 'static';
 		o.rmempty = false;
 
 		o = s.option(GaleColorValue, 'color', _('Color'),
 			_('Choose the static or pattern color graphically, or enter an exact #RRGGBB value.'));
 		o.default = '#A020F0';
-		o.validate = function(sectionId, value) {
-			return /^#[0-9A-Fa-f]{6}$/.test(value)
-				? true
-				: _('Enter a color in the exact #RRGGBB form.');
-		};
+		o.validate = validateGaleColor;
 		o.rmempty = false;
 		o.retain = true;
 		o.depends('mode', 'static');
@@ -158,6 +166,7 @@ return view.extend({
 		o.datatype = 'or(ipaddr,hostname)';
 		o.rmempty = false;
 		o.depends('icmp_enabled', '1');
+		o.depends('mode', 'latency');
 
 		o = s.option(form.Value, 'icmp_start_delay', _('Start delay'),
 			_('Seconds to wait after the service starts before performing the first ICMP check. Use 0 for no delay.'));
@@ -170,6 +179,7 @@ return view.extend({
 				: _('Start delay must be a non-negative integer.');
 		};
 		o.depends('icmp_enabled', '1');
+		o.depends('mode', 'latency');
 
 		o = s.option(form.ListValue, 'failure_mode', _('Failure behavior'),
 			_('LED behavior used while the ICMP target is in the failure state.'));
@@ -178,6 +188,7 @@ return view.extend({
 		o.value('breathing', _('Breathing'));
 		o.value('network_activity', _('Network activity'));
 		o.value('network_heartbeat', _('Network heartbeat'));
+		o.value('latency', _('Latency'));
 		o.default = 'static';
 		o.rmempty = false;
 		o.depends('icmp_enabled', '1');
@@ -185,11 +196,7 @@ return view.extend({
 		o = s.option(GaleColorValue, 'failure_color', _('Failure color'),
 			_('Color used by the selected failure behavior.'));
 		o.default = '#FF0000';
-		o.validate = function(sectionId, value) {
-			return /^#[0-9A-Fa-f]{6}$/.test(value)
-				? true
-				: _('Enter a color in the exact #RRGGBB form.');
-		};
+		o.validate = validateGaleColor;
 		o.rmempty = false;
 		o.retain = true;
 		o.depends({ icmp_enabled: '1', failure_mode: 'static' });
@@ -243,6 +250,52 @@ return view.extend({
 				: _('Restore must be an integer of at least 1.');
 		};
 		o.depends('icmp_enabled', '1');
+
+		o = s.option(form.Value, 'latency_fast_below', _('Fast threshold'),
+			_('Latency below this many milliseconds uses the fast color.'));
+		o.default = '50';
+		o.datatype = 'uinteger';
+		o.rmempty = false;
+		dependsOnLatency(o);
+
+		o = s.option(form.Value, 'latency_moderate_max', _('Moderate maximum'),
+			_('Latency at or below this many milliseconds uses the moderate color.'));
+		o.default = '100';
+		o.datatype = 'uinteger';
+		o.rmempty = false;
+		dependsOnLatency(o);
+
+		o = s.option(form.Value, 'latency_slow_max', _('Slow maximum'),
+			_('Latency at or below this many milliseconds uses the slow color; higher latency uses the high-latency color.'));
+		o.default = '150';
+		o.datatype = 'uinteger';
+		o.rmempty = false;
+		dependsOnLatency(o);
+
+		o = s.option(GaleColorValue, 'latency_fast_color', _('Fast color'));
+		o.default = '#0000FF';
+		o.validate = validateGaleColor;
+		o.rmempty = false;
+		dependsOnLatency(o);
+
+		o = s.option(GaleColorValue, 'latency_moderate_color', _('Moderate color'));
+		o.default = '#00FF00';
+		o.validate = validateGaleColor;
+		o.rmempty = false;
+		dependsOnLatency(o);
+
+		o = s.option(GaleColorValue, 'latency_slow_color', _('Slow color'));
+		o.default = '#FFFF00';
+		o.validate = validateGaleColor;
+		o.rmempty = false;
+		dependsOnLatency(o);
+
+		o = s.option(GaleColorValue, 'latency_high_color', _('High-latency color'),
+			_('Also used when an ICMP probe fails or has no latency result.'));
+		o.default = '#FF0000';
+		o.validate = validateGaleColor;
+		o.rmempty = false;
+		dependsOnLatency(o);
 
 		return m.render().then(function(formNode) {
 			var notice;

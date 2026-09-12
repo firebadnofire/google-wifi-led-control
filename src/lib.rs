@@ -141,6 +141,7 @@ pub enum Mode {
     Breathing,
     NetworkActivity,
     NetworkHeartbeat,
+    Latency,
 }
 
 impl Mode {
@@ -151,8 +152,9 @@ impl Mode {
             "breathing" => Ok(Self::Breathing),
             "network_activity" => Ok(Self::NetworkActivity),
             "network_heartbeat" => Ok(Self::NetworkHeartbeat),
+            "latency" => Ok(Self::Latency),
             _ => Err(Error::Config(format!(
-                "mode must be static, rainbow, breathing, network_activity, or network_heartbeat; got {value}"
+                "mode must be static, rainbow, breathing, network_activity, network_heartbeat, or latency; got {value}"
             ))),
         }
     }
@@ -164,6 +166,7 @@ impl Mode {
             Self::Breathing => "breathing",
             Self::NetworkActivity => "network_activity",
             Self::NetworkHeartbeat => "network_heartbeat",
+            Self::Latency => "latency",
         }
     }
 
@@ -228,6 +231,58 @@ pub struct BehaviorConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LatencyConfig {
+    pub fast_below: u64,
+    pub moderate_max: u64,
+    pub slow_max: u64,
+    pub fast_color: Color,
+    pub moderate_color: Color,
+    pub slow_color: Color,
+    pub high_color: Color,
+}
+
+impl Default for LatencyConfig {
+    fn default() -> Self {
+        Self {
+            fast_below: 50,
+            moderate_max: 100,
+            slow_max: 150,
+            fast_color: Color {
+                red: 0,
+                green: 0,
+                blue: 255,
+            },
+            moderate_color: Color {
+                red: 0,
+                green: 255,
+                blue: 0,
+            },
+            slow_color: Color {
+                red: 255,
+                green: 255,
+                blue: 0,
+            },
+            high_color: Color {
+                red: 255,
+                green: 0,
+                blue: 0,
+            },
+        }
+    }
+}
+
+impl LatencyConfig {
+    pub fn color_for(&self, latency_ms: Option<u64>) -> Color {
+        match latency_ms {
+            Some(value) if value < self.fast_below => self.fast_color,
+            Some(value) if value <= self.moderate_max => self.moderate_color,
+            Some(value) if value <= self.slow_max => self.slow_color,
+            _ => self.high_color,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcmpConfig {
     pub enabled: bool,
     pub target: String,
@@ -235,6 +290,7 @@ pub struct IcmpConfig {
     pub failure: BehaviorConfig,
     pub retries: u32,
     pub restore: u32,
+    pub latency: LatencyConfig,
 }
 
 impl Default for IcmpConfig {
@@ -255,6 +311,7 @@ impl Default for IcmpConfig {
             },
             retries: 3,
             restore: 2,
+            latency: LatencyConfig::default(),
         }
     }
 }
@@ -341,7 +398,8 @@ impl Config {
     ) -> Result<Self, Error> {
         Self::from_all_values(
             enabled, color, brightness, mode, interface, "0", "1.1.1.1", "15", "static", "#FF0000",
-            "100", "br-lan", "3", "2",
+            "100", "br-lan", "3", "2", "50", "100", "150", "#0000FF", "#00FF00", "#FFFF00",
+            "#FF0000",
         )
     }
 
@@ -361,6 +419,13 @@ impl Config {
         failure_interface: &str,
         icmp_retries: &str,
         icmp_restore: &str,
+        latency_fast_below: &str,
+        latency_moderate_max: &str,
+        latency_slow_max: &str,
+        latency_fast_color: &str,
+        latency_moderate_color: &str,
+        latency_slow_color: &str,
+        latency_high_color: &str,
     ) -> Result<Self, Error> {
         let enabled = match enabled {
             "1" => true,
@@ -391,35 +456,83 @@ impl Config {
             }
             Ok(value)
         };
-        let icmp = if icmp_enabled {
+        let defaults = IcmpConfig::default();
+        let failure = if icmp_enabled {
+            let mode = Mode::parse(failure_mode)?;
+            let color =
+                Color::from_hex(failure_color).map_err(|error| Error::Config(error.to_string()))?;
+            let brightness = failure_brightness.parse::<u8>().map_err(|_| {
+                Error::Config("failure_brightness must be an integer from 0 through 100".into())
+            })?;
+            validate_brightness(brightness).map_err(|error| Error::Config(error.to_string()))?;
+            validate_interface_name(failure_interface)?;
+            BehaviorConfig {
+                mode,
+                color,
+                brightness,
+                interface: failure_interface.into(),
+            }
+        } else {
+            defaults.failure.clone()
+        };
+        let monitoring_needed = icmp_enabled || mode == Mode::Latency;
+        let (target, start_delay) = if monitoring_needed {
             validate_icmp_target(icmp_target)?;
             let start_delay = icmp_start_delay.parse::<u64>().map_err(|_| {
                 Error::Config("icmp_start_delay must be a non-negative integer".into())
             })?;
-            let failure_mode = Mode::parse(failure_mode)?;
-            let failure_color =
-                Color::from_hex(failure_color).map_err(|error| Error::Config(error.to_string()))?;
-            let failure_brightness = failure_brightness.parse::<u8>().map_err(|_| {
-                Error::Config("failure_brightness must be an integer from 0 through 100".into())
-            })?;
-            validate_brightness(failure_brightness)
-                .map_err(|error| Error::Config(error.to_string()))?;
-            validate_interface_name(failure_interface)?;
-            IcmpConfig {
-                enabled: true,
-                target: icmp_target.into(),
-                start_delay,
-                failure: BehaviorConfig {
-                    mode: failure_mode,
-                    color: failure_color,
-                    brightness: failure_brightness,
-                    interface: failure_interface.into(),
-                },
-                retries: parse_threshold("icmp_retries", icmp_retries)?,
-                restore: parse_threshold("icmp_restore", icmp_restore)?,
+            (icmp_target.into(), start_delay)
+        } else {
+            (defaults.target.clone(), defaults.start_delay)
+        };
+        let latency_needed =
+            mode == Mode::Latency || (icmp_enabled && failure.mode == Mode::Latency);
+        let latency = if latency_needed {
+            let parse_boundary = |name: &str, value: &str| -> Result<u64, Error> {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| Error::Config(format!("{name} must be a non-negative integer")))
+            };
+            let fast_below = parse_boundary("latency_fast_below", latency_fast_below)?;
+            let moderate_max = parse_boundary("latency_moderate_max", latency_moderate_max)?;
+            let slow_max = parse_boundary("latency_slow_max", latency_slow_max)?;
+            if fast_below == 0 || fast_below > moderate_max || moderate_max >= slow_max {
+                return Err(Error::Config(
+                    "latency thresholds must satisfy 0 < fast below <= moderate maximum < slow maximum"
+                        .into(),
+                ));
+            }
+            let parse_color = |value: &str| {
+                Color::from_hex(value).map_err(|error| Error::Config(error.to_string()))
+            };
+            LatencyConfig {
+                fast_below,
+                moderate_max,
+                slow_max,
+                fast_color: parse_color(latency_fast_color)?,
+                moderate_color: parse_color(latency_moderate_color)?,
+                slow_color: parse_color(latency_slow_color)?,
+                high_color: parse_color(latency_high_color)?,
             }
         } else {
-            IcmpConfig::default()
+            LatencyConfig::default()
+        };
+        let icmp = IcmpConfig {
+            enabled: icmp_enabled,
+            target,
+            start_delay,
+            failure,
+            retries: if icmp_enabled {
+                parse_threshold("icmp_retries", icmp_retries)?
+            } else {
+                defaults.retries
+            },
+            restore: if icmp_enabled {
+                parse_threshold("icmp_restore", icmp_restore)?
+            } else {
+                defaults.restore
+            },
+            latency,
         };
 
         Ok(Self {
@@ -476,6 +589,13 @@ impl Config {
             &optional("failure_interface", "br-lan")?,
             &optional("icmp_retries", "3")?,
             &optional("icmp_restore", "2")?,
+            &optional("latency_fast_below", "50")?,
+            &optional("latency_moderate_max", "100")?,
+            &optional("latency_slow_max", "150")?,
+            &optional("latency_fast_color", "#0000FF")?,
+            &optional("latency_moderate_color", "#00FF00")?,
+            &optional("latency_slow_color", "#FFFF00")?,
+            &optional("latency_high_color", "#FF0000")?,
         )
     }
 
@@ -736,17 +856,18 @@ pub fn run(config: &Config, hardware: &Hardware) -> Result<(), Error> {
     let normal_behavior = config.normal_behavior();
     let failure_behavior = config.icmp.failure.clone();
     let mut active = BehaviorRuntime::new(config.enabled, &normal_behavior)?;
-    let results = config
-        .icmp
-        .enabled
+    let monitoring_enabled = config.icmp.enabled || config.mode == Mode::Latency;
+    let results = monitoring_enabled
         .then(|| start_icmp_monitor(&config.icmp.target, config.icmp.start_delay));
     let mut icmp_state = IcmpState::new(&config.icmp);
+    let mut latest_latency_ms = None;
     let mut last_color = None;
 
     loop {
         if let Some(results) = &results {
-            for success in results.try_iter() {
-                if let Some(failed) = icmp_state.observe(success) {
+            for result in results.try_iter() {
+                latest_latency_ms = result.latency_ms;
+                if let Some(failed) = icmp_state.observe(result.success) {
                     if failed {
                         eprintln!("ICMP target entered failure state: {}", config.icmp.target);
                         active = BehaviorRuntime::new(true, &failure_behavior)?;
@@ -759,7 +880,7 @@ pub fn run(config: &Config, hardware: &Hardware) -> Result<(), Error> {
             }
         }
 
-        let color = active.frame()?;
+        let color = active.frame(latest_latency_ms, &config.icmp.latency)?;
         if last_color != Some(color) {
             hardware.set_prepared(color, 100)?;
             last_color = Some(color);
@@ -796,7 +917,7 @@ impl BehaviorRuntime {
         })
     }
 
-    fn frame(&mut self) -> Result<Color, Error> {
+    fn frame(&mut self, latency_ms: Option<u64>, latency: &LatencyConfig) -> Result<Color, Error> {
         if !self.enabled {
             return Ok(Color {
                 red: 0,
@@ -841,6 +962,9 @@ impl BehaviorRuntime {
                     .color
                     .scaled(effect_brightness(self.behavior.brightness, level))
             }
+            Mode::Latency => latency
+                .color_for(latency_ms)
+                .scaled(self.behavior.brightness),
         }
     }
 
@@ -852,14 +976,23 @@ impl BehaviorRuntime {
     }
 }
 
-fn start_icmp_monitor(target: &str, start_delay: u64) -> Receiver<bool> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IcmpProbeResult {
+    success: bool,
+    latency_ms: Option<u64>,
+}
+
+fn start_icmp_monitor(target: &str, start_delay: u64) -> Receiver<IcmpProbeResult> {
     let target = target.to_owned();
     start_icmp_monitor_with_probe(Duration::from_secs(start_delay), move || icmp_echo(&target))
 }
 
-fn start_icmp_monitor_with_probe<F>(start_delay: Duration, mut probe: F) -> Receiver<bool>
+fn start_icmp_monitor_with_probe<F>(
+    start_delay: Duration,
+    mut probe: F,
+) -> Receiver<IcmpProbeResult>
 where
-    F: FnMut() -> bool + Send + 'static,
+    F: FnMut() -> IcmpProbeResult + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -876,23 +1009,41 @@ where
     receiver
 }
 
-fn icmp_echo(target: &str) -> bool {
+fn icmp_echo(target: &str) -> IcmpProbeResult {
     icmp_echo_with(PING_BIN, target)
 }
 
-fn icmp_echo_with(binary: &str, target: &str) -> bool {
+fn icmp_echo_with(binary: &str, target: &str) -> IcmpProbeResult {
     let mut command = Command::new(binary);
     command.args(["-n", "-c", "1", "-W", ICMP_TIMEOUT_SECONDS]);
     if target.parse::<Ipv6Addr>().is_ok() {
         command.arg("-6");
     }
-    command
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let started = Instant::now();
+    let output = command.arg(target).stdin(Stdio::null()).output();
+    match output {
+        Ok(output) if output.status.success() => IcmpProbeResult {
+            success: true,
+            latency_ms: parse_ping_latency(&output.stdout)
+                .or_else(|| parse_ping_latency(&output.stderr))
+                .or_else(|| Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))),
+        },
+        _ => IcmpProbeResult {
+            success: false,
+            latency_ms: None,
+        },
+    }
+}
+
+fn parse_ping_latency(output: &[u8]) -> Option<u64> {
+    let output = std::str::from_utf8(output).ok()?;
+    let marker = output.rfind("time=").or_else(|| output.rfind("time<"))?;
+    let value = &output[marker + 5..];
+    let end = value
+        .find(|character: char| !character.is_ascii_digit() && character != '.')
+        .unwrap_or(value.len());
+    let milliseconds = value[..end].parse::<f64>().ok()?;
+    milliseconds.is_finite().then(|| milliseconds.ceil() as u64)
 }
 
 fn effect_brightness(maximum: u8, level: u8) -> u8 {
@@ -1116,6 +1267,7 @@ mod tests {
                     },
                     retries: 3,
                     restore: 2,
+                    latency: LatencyConfig::default(),
                 },
             }
         );
@@ -1146,6 +1298,7 @@ mod tests {
             },
             retries,
             restore,
+            latency: LatencyConfig::default(),
         }
     }
 
@@ -1216,10 +1369,20 @@ mod tests {
         for invalid in ["", "-option", "bad target", "bad..target"] {
             assert!(validate_icmp_target(invalid).is_err());
         }
-        assert!(!icmp_echo_with(
-            "/definitely/not/a/ping-binary",
-            "unresolvable.invalid"
-        ));
+        assert!(!icmp_echo_with("/definitely/not/a/ping-binary", "unresolvable.invalid").success);
+    }
+
+    #[test]
+    fn parses_busybox_ping_latency() {
+        assert_eq!(
+            parse_ping_latency(b"64 bytes from 1.1.1.1: seq=0 ttl=57 time=12.345 ms"),
+            Some(13)
+        );
+        assert_eq!(
+            parse_ping_latency(b"64 bytes from ::1: seq=0 ttl=64 time<1 ms"),
+            Some(1)
+        );
+        assert_eq!(parse_ping_latency(b"ping: bad address 'invalid'"), None);
     }
 
     #[test]
@@ -1252,6 +1415,13 @@ mod tests {
             "not an interface",
             "0",
             "0",
+            "not-a-threshold",
+            "not-a-threshold",
+            "not-a-threshold",
+            "not-a-color",
+            "not-a-color",
+            "not-a-color",
+            "not-a-color",
         )
         .unwrap();
         assert_eq!(config.icmp, IcmpConfig::default());
@@ -1259,16 +1429,24 @@ mod tests {
 
     #[test]
     fn icmp_worker_waits_before_first_probe() {
-        let results = start_icmp_monitor_with_probe(Duration::from_millis(50), || true);
+        let expected = IcmpProbeResult {
+            success: true,
+            latency_ms: Some(12),
+        };
+        let results = start_icmp_monitor_with_probe(Duration::from_millis(50), move || expected);
         assert!(results.recv_timeout(Duration::from_millis(10)).is_err());
-        assert_eq!(results.recv_timeout(Duration::from_millis(200)), Ok(true));
+        assert_eq!(
+            results.recv_timeout(Duration::from_millis(200)),
+            Ok(expected)
+        );
     }
 
     #[test]
     fn parses_configurable_icmp_start_delay() {
         let config = Config::from_all_values(
             "1", "#A020F0", "75", "static", "br-lan", "1", "1.1.1.1", "0", "static", "#FF0000",
-            "100", "br-lan", "3", "2",
+            "100", "br-lan", "3", "2", "50", "100", "150", "#0000FF", "#00FF00", "#FFFF00",
+            "#FF0000",
         )
         .unwrap();
         assert_eq!(config.icmp.start_delay, 0);
@@ -1276,7 +1454,94 @@ mod tests {
         assert!(
             Config::from_all_values(
                 "1", "#A020F0", "75", "static", "br-lan", "1", "1.1.1.1", "-1", "static",
-                "#FF0000", "100", "br-lan", "3", "2",
+                "#FF0000", "100", "br-lan", "3", "2", "50", "100", "150", "#0000FF", "#00FF00",
+                "#FFFF00", "#FF0000",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn classifies_latency_boundaries_and_packet_loss() {
+        let latency = LatencyConfig::default();
+        assert_eq!(latency.color_for(Some(49)).to_hex(), "#0000FF");
+        assert_eq!(latency.color_for(Some(50)).to_hex(), "#00FF00");
+        assert_eq!(latency.color_for(Some(100)).to_hex(), "#00FF00");
+        assert_eq!(latency.color_for(Some(101)).to_hex(), "#FFFF00");
+        assert_eq!(latency.color_for(Some(150)).to_hex(), "#FFFF00");
+        assert_eq!(latency.color_for(Some(151)).to_hex(), "#FF0000");
+        assert_eq!(latency.color_for(None).to_hex(), "#FF0000");
+    }
+
+    #[test]
+    fn latency_mode_works_without_failure_override() {
+        let config = Config::from_all_values(
+            "1",
+            "#A020F0",
+            "75",
+            "latency",
+            "br-lan",
+            "0",
+            "example.com",
+            "15",
+            "ignored",
+            "ignored",
+            "ignored",
+            "ignored",
+            "ignored",
+            "ignored",
+            "40",
+            "80",
+            "120",
+            "#010203",
+            "#040506",
+            "#070809",
+            "#0A0B0C",
+        )
+        .unwrap();
+        assert!(!config.icmp.enabled);
+        assert_eq!(config.icmp.target, "example.com");
+        assert_eq!(config.icmp.latency.fast_below, 40);
+        assert_eq!(config.icmp.latency.color_for(Some(121)).to_hex(), "#0A0B0C");
+    }
+
+    #[test]
+    fn latency_mode_is_valid_for_icmp_failure_behavior() {
+        let config = Config::from_all_values(
+            "1",
+            "#A020F0",
+            "75",
+            "static",
+            "br-lan",
+            "1",
+            "example.com",
+            "15",
+            "latency",
+            "#FF0000",
+            "80",
+            "br-lan",
+            "3",
+            "2",
+            "50",
+            "100",
+            "150",
+            "#0000FF",
+            "#00FF00",
+            "#FFFF00",
+            "#FF0000",
+        )
+        .unwrap();
+        assert_eq!(config.icmp.failure.mode, Mode::Latency);
+        assert_eq!(config.icmp.latency.color_for(Some(75)).to_hex(), "#00FF00");
+    }
+
+    #[test]
+    fn rejects_overlapping_latency_thresholds() {
+        assert!(
+            Config::from_all_values(
+                "1", "#A020F0", "75", "latency", "br-lan", "0", "1.1.1.1", "15", "static",
+                "#FF0000", "100", "br-lan", "3", "2", "101", "100", "150", "#0000FF", "#00FF00",
+                "#FFFF00", "#FF0000",
             )
             .is_err()
         );
